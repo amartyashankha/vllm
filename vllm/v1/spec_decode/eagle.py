@@ -1159,9 +1159,21 @@ class SpecDecodeBaseProposer:
                     target_model.config.vision_config.image_token_id
                 )
             else:
-                self.model.config.image_token_index = (
-                    target_model.config.image_token_index
+                image_token_index = getattr(
+                    target_model.config, "image_token_index", None
                 )
+                if image_token_index is None:
+                    image_token_index = getattr(
+                        target_model.config, "image_token_id", None
+                    )
+                if image_token_index is not None:
+                    self.model.config.image_token_index = image_token_index
+                else:
+                    logger.debug(
+                        "Target model %s has no image token index in config; "
+                        "continuing without setting draft image_token_index.",
+                        self.get_model_name(target_model),
+                    )
             target_language_model = cast(
                 SupportsMultiModal, target_model
             ).get_language_model()

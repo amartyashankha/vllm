@@ -14,7 +14,11 @@ from transformers.models.whisper import WhisperFeatureExtractor
 from vllm.config import ModelConfig, VllmConfig
 from vllm.config.speech_to_text import SpeechToTextConfig
 from vllm.logger import init_logger
-from vllm.model_executor.models.interfaces import SupportsMultiModal, SupportsPP
+from vllm.model_executor.models.interfaces import (
+    SupportsEagle3,
+    SupportsMultiModal,
+    SupportsPP,
+)
 from vllm.model_executor.models.utils import init_vllm_registered_model, maybe_prefix
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.sequence import IntermediateTensors
@@ -43,6 +47,7 @@ from vllm.transformers_utils.processors.vibevoice_asr import (
     COMMON_AUDIO_EXTS,
     load_audio_use_ffmpeg,
     load_audio_bytes_use_ffmpeg,
+    VibeVoiceTokenizerStreamingCache,
     VibeVoiceTokenizerEncoderOutput,
     VibeVoiceAcousticTokenizerModel,
     VibeVoiceSemanticTokenizerModel,
@@ -700,7 +705,12 @@ class VibeVoiceASRMultiModalProcessor(BaseMultiModalProcessor[VibeVoiceASRProces
     info=VibeVoiceASRProcessingInfo,
     dummy_inputs=VibeVoiceASRDummyInputsBuilder,
 )
-class VibeVoiceASRForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP):
+class VibeVoiceASRForConditionalGeneration(
+    nn.Module,
+    SupportsMultiModal,
+    SupportsPP,
+    SupportsEagle3,
+):
     """
     This model combines VibeVoice acoustic/semantic tokenizers for audio encoding
     with a causal language model for text generation.
@@ -911,6 +921,23 @@ class VibeVoiceASRForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
     def get_language_model(self) -> torch.nn.Module:
         """Return the language model backbone."""
         return self.language_model
+
+    def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        """Configure verifier layers used to emit EAGLE3 auxiliary hidden states."""
+        if hasattr(self.language_model, "set_aux_hidden_state_layers"):
+            self.language_model.set_aux_hidden_state_layers(layers)
+            return
+
+        # Fallback for wrappers that expose the underlying Qwen2 model directly.
+        self.language_model.model.aux_hidden_state_layers = layers
+
+    def get_eagle3_aux_hidden_state_layers(self) -> tuple[int, ...]:
+        """Return default verifier layer taps for EAGLE3 auxiliary hidden states."""
+        if hasattr(self.language_model, "get_eagle3_aux_hidden_state_layers"):
+            return self.language_model.get_eagle3_aux_hidden_state_layers()
+
+        num_layers = len(self.language_model.model.layers)
+        return (2, num_layers // 2, num_layers - 3)
 
     def load_weights(self, weights: list[tuple[str, torch.Tensor]]) -> set[str]:
         """Load model weights from checkpoint."""

@@ -299,7 +299,18 @@ class Eagle3LlamaForCausalLM(LlamaForCausalLM):
         multimodal_embeddings: NestedTensors | None = None,
         is_multimodal: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        return self.model.embed_input_ids(input_ids)
+        inputs_embeds = self.model.embed_input_ids(input_ids)
+        if multimodal_embeddings is not None and is_multimodal is not None:
+            from vllm.model_executor.models.utils import (
+                _merge_multimodal_embeddings,
+            )
+
+            inputs_embeds = _merge_multimodal_embeddings(
+                inputs_embeds=inputs_embeds,
+                multimodal_embeddings=multimodal_embeddings,
+                is_multimodal=is_multimodal,
+            )
+        return inputs_embeds
 
     def forward(
         self,
