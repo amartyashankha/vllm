@@ -72,6 +72,8 @@ VibeVoice-ASR requests.
 - Added `get_metrics_snapshot()` method to expose parsed vLLM `/metrics`
   counters (prefill/decode/e2e/ttft/queue + speculative counters) for
   per-request profiling via before/after metric deltas.
+- Added `transcribe_chunk_two_pass_capture()` to run generation and hidden-state
+  prefill capture sequentially on the same deployed vLLM server.
 
 **Why it was needed**
 - Needed a reliable way to run patched Python code while keeping compiled vLLM
@@ -80,6 +82,35 @@ VibeVoice-ASR requests.
 - Enabled controlled baseline vs EAGLE3 rollouts and debugging.
 - Enabled direct profiling of prefill vs decode time on real captured payloads
   without custom engine instrumentation.
+- Added an end-to-end hook for vLLM-only two-pass data regeneration at request
+  granularity.
+
+---
+
+### 5) vLLM-native hidden-state capture prototype
+
+**What changed**
+- Added `vllm/v1/worker/hidden_state_capture.py` with
+  `HiddenStateCaptureManager` to accumulate prefill hidden-state chunks and
+  persist `.ckpt` files per request.
+- Wired `vllm/v1/worker/gpu_model_runner.py` to:
+  - capture prefill-only tokens per request from model output,
+  - include aux layers when present (EAGLE3 path),
+  - finalize and save capture files when requests finish.
+- Extended `serve.py` to support capture-triggered requests:
+  - `transcribe_chunk(..., capture_hidden_states=False, capture_id=None)`
+  - sets `vllm_xargs.capture_hidden_states/capture_id` for the OpenAI request.
+  - adds helper `list_hidden_state_captures(...)`.
+- Added a dedicated hidden-state output volume:
+  - fresh v2 volume name: `eagle3-hidden-states-v2` (env-overridable)
+  - mount path: `/hidden-states-v2`
+  - env passed to vLLM workers: `VLLM_HIDDEN_STATES_OUTPUT_DIR`.
+
+**Why it was needed**
+- OpenAI-compatible responses do not directly return hidden states.
+- Offline EAGLE3 draft training requires verifier hidden states at scale.
+- We need capture inside the same vLLM multimodal execution path as production
+  (audio-conditioned), not a separate fallback stack.
 
 ## Result
 
@@ -87,3 +118,5 @@ With these changes:
 - VibeVoice-ASR runs with EAGLE3 on real audio payloads.
 - Real captured 300s payload replay succeeds end-to-end.
 - No speculative-path shape/assert crashes were observed in the validated runs.
+- A first vLLM-native hidden-state capture path now exists for incremental pilot
+  runs on real requests, with output persisted to a dedicated v2 volume.

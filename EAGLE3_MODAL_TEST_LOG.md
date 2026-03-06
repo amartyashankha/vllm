@@ -341,6 +341,62 @@ Current recommendation:
 - Implement a small pilot (100-500 requests) first, validate hidden tensor
   integrity and training-readiness schema, then scale to full traffic replay.
 
+### Hidden capture prototype (vLLM-only, incremental)
+
+Implemented first-pass vLLM-native hidden capture wiring:
+- Added `HiddenStateCaptureManager` in
+  `vllm/v1/worker/hidden_state_capture.py`.
+- Wired `GPUModelRunner` to:
+  - capture **prefill-only** chunks per request (ignores decode tokens),
+  - optionally include EAGLE3 aux layers when available,
+  - finalize and persist `.ckpt` when request finishes.
+- Capture is request-gated via OpenAI request `vllm_xargs`:
+  - `capture_hidden_states: true`
+  - `capture_id: "<stable-id>"`
+- `serve.py` updates:
+  - `transcribe_chunk(..., capture_hidden_states=False, capture_id=None)`
+  - `transcribe_chunk_two_pass_capture(..., capture_id=None)`:
+    - pass 1: normal generation/transcription
+    - pass 2: prefill-only capture request (`max_tokens=1`) on full conversation
+      using the same deployed vLLM server
+  - hidden capture metadata returned in response (`capture_id`, relpath/path)
+  - `list_hidden_state_captures(limit=...)` helper method.
+
+Storage decision (requested):
+- Use a **fresh v2 hidden-state volume**:
+  - volume name: `eagle3-hidden-states-v2` (overridable via env var)
+  - mount path: `/hidden-states-v2`
+  - worker env: `VLLM_HIDDEN_STATES_OUTPUT_DIR=/hidden-states-v2`
+
+Small local validation completed:
+- Syntax compile checks passed for modified files.
+- `HiddenStateCaptureManager` smoke test passed with dummy tensors:
+  - output file written
+  - `hidden_state` and `aux_hidden_state` shapes match expectations.
+
+Live smoke validation (tiny request):
+- Deployed updated `serve.py` to `shankha-dev`.
+- Added/fixed same-deployment two-pass method call path
+  (`transcribe_chunk_two_pass_capture` -> `transcribe_chunk.local(...)`).
+- Ran a tiny 0.25s silent WAV request with
+  `capture_id=pilot-smoke-1772751972`.
+- Result:
+  - `error=None`
+  - `capture_error=None`
+  - `hidden_state_relpath=pi/pilot-smoke-1772751972.ckpt`
+  - `list_hidden_state_captures(limit=5)` returned that file
+  - `two_pass_timing_s=9.314` (method timing)
+  - end-to-end client wall (including cold start): ~207s
+
+Scaling note (high-level):
+- Not arbitrary/unbounded. Throughput is constrained by:
+  - GPU memory + scheduler limits (`max_num_seqs`, batched tokens),
+  - host RAM pressure from temporary hidden-state chunk buffers,
+  - v2 volume write/commit throughput and file-count behavior,
+  - per-request multimodal preprocessing cost (audio path).
+- For scale-out, keep capture opt-in and run dedicated regen workers with lower
+  concurrency than latency-benchmark settings.
+
 ### Prefill vs decode profiling (new)
 
 - Added `get_metrics_snapshot()` method in `serve.py` that fetches

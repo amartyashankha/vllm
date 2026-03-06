@@ -167,6 +167,7 @@ from vllm.v1.worker.dp_utils import coordinate_batch_across_dp
 from vllm.v1.worker.ec_connector_model_runner_mixin import ECConnectorModelRunnerMixin
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 from vllm.v1.worker.gpu_ubatch_wrapper import UBatchWrapper
+from vllm.v1.worker.hidden_state_capture import HiddenStateCaptureManager
 from vllm.v1.worker.kv_connector_model_runner_mixin import KVConnectorModelRunnerMixin
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
 from vllm.v1.worker.ubatch_utils import (
@@ -490,6 +491,7 @@ class GPUModelRunner(
 
         # Request states.
         self.requests: dict[str, CachedRequestState] = {}
+        self.hidden_state_capture = HiddenStateCaptureManager.from_env()
         # NOTE(rob): num_prompt_logprobs only includes reqs
         # that are currently in the prefill phase.
         self.num_prompt_logprobs: dict[str, int] = {}
@@ -882,6 +884,11 @@ class GPUModelRunner(
         """
         # Remove finished requests from the cached states.
         for req_id in scheduler_output.finished_req_ids:
+            req_state = self.requests.get(req_id)
+            if req_state is not None:
+                self.hidden_state_capture.finalize_request(req_state)
+            else:
+                self.hidden_state_capture.discard_request(req_id)
             self.requests.pop(req_id, None)
             self.num_prompt_logprobs.pop(req_id, None)
         # Remove the finished requests from the persistent batch.
@@ -1401,6 +1408,51 @@ class GPUModelRunner(
             index=draft_tokens_index_tensor,
             src=draft_token_ids.flatten()[prev_draft_token_indices_tensor],
         )
+
+    def _capture_prefill_hidden_states(
+        self,
+        num_scheduled_tokens_np: np.ndarray,
+        hidden_states: torch.Tensor,
+        aux_hidden_states: list[torch.Tensor] | None,
+    ) -> None:
+        if not self.hidden_state_capture.enabled:
+            return
+
+        token_cursor = 0
+        for req_idx, req_id in enumerate(self.input_batch.req_ids):
+            num_scheduled = int(num_scheduled_tokens_np[req_idx])
+            if num_scheduled <= 0:
+                continue
+
+            req_state = self.requests.get(req_id)
+            if req_state is None:
+                token_cursor += num_scheduled
+                continue
+            if not self.hidden_state_capture.should_capture(req_state):
+                token_cursor += num_scheduled
+                continue
+
+            prompt_remaining = (
+                req_state.num_prompt_tokens - req_state.num_computed_tokens
+            )
+            num_prefill_tokens = min(num_scheduled, max(prompt_remaining, 0))
+            if num_prefill_tokens <= 0:
+                token_cursor += num_scheduled
+                continue
+
+            start = token_cursor
+            end = token_cursor + num_prefill_tokens
+            aux_chunks = (
+                [aux_layer[start:end] for aux_layer in aux_hidden_states]
+                if aux_hidden_states is not None
+                else None
+            )
+            self.hidden_state_capture.append_prefill_chunk(
+                req_state=req_state,
+                hidden_chunk=hidden_states[start:end],
+                aux_hidden_chunks=aux_chunks,
+            )
+            token_cursor += num_scheduled
 
     def _get_encoder_seq_lens(
         self,
@@ -3543,6 +3595,18 @@ class GPUModelRunner(
                 # Common case.
                 hidden_states = model_output
                 aux_hidden_states = None
+
+            if get_pp_group().is_last_rank and not self.is_pooling_model:
+                aux_for_capture = (
+                    [h[:num_scheduled_tokens] for h in aux_hidden_states]
+                    if aux_hidden_states is not None
+                    else None
+                )
+                self._capture_prefill_hidden_states(
+                    num_scheduled_tokens_np=num_scheduled_tokens_np,
+                    hidden_states=hidden_states[:num_scheduled_tokens],
+                    aux_hidden_states=aux_for_capture,
+                )
 
             if not self.broadcast_pp_output:
                 # Common case.
